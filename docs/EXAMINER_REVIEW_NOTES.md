@@ -19,16 +19,6 @@ The following active analysis modules and their associated tests were inspected:
 
 All requested files were available in the workspace.
 
-## Preserved baseline
-
-The exact pre-review text of the reviewed scripts, tests, README, and original
-misspelled dependency file is retained in:
-
-`archive/pre_examiner_review_2026-09-21/`
-
-Python source snapshots use `.py.original` so they remain readable but are not
-collected as tests or imported as active code.
-
 ## Change classification
 
 This review made documentation and repository-hygiene changes only:
