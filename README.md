@@ -22,11 +22,6 @@ The repository preserves the analysis hierarchy used in the thesis:
 | `tests/` | Unit and integration tests for validation, calculations, blocked inference, and plotting contracts. |
 | `results/` | Generated tables and figures. These are derived outputs, not raw data. |
 
-The exact source state immediately before the examiner-readiness documentation
-review is retained under `archive/pre_examiner_review_2026-09-21/`. Archived
-Python files use the suffix `.py.original` so pytest cannot accidentally collect
-or import them. The active scripts above remain the authoritative versions.
-
 ### Original-to-repository filename map
 
 The supplied scripts did not need upload-suffix removal; their descriptive
