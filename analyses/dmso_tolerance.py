@@ -1,0 +1,554 @@
+"""Analyse one DMSO-tolerance plate-reader export.
+
+The command imports an annotated BMG CLARIOstar CSV, validates either the full
+60-well design or the smaller DMSO-only design, applies the established
+time-matched blank correction once, and exports raw/corrected QC tables and
+figures. AUC is integrated from observed corrected OD600 and each technical
+well is fitted independently with the shared modified Gompertz implementation.
+Technical wells are then summarized into one result per biological replicate,
+species, and DMSO condition.
+
+This script analyses one input dataset per invocation. It does not combine
+biological replicates or perform inferential statistics, and it never writes to
+the source CSV.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from growth_analysis import (  # noqa: E402
+    DEFAULT_A2_EXCLUSION_REASON,
+    DISPLAY_SPECIES,
+    DMSO_ONLY_DMSO_PERCENT,
+    DMSO_ONLY_REPLICATES_BY_DMSO,
+    DMSO_ONLY_TIME_MIN,
+    EXPECTED_DMSO_PERCENT,
+    EXPECTED_TIME_MIN,
+    apply_time_matched_blank_correction,
+    calculate_w_response,
+    fit_all_wells,
+    flag_quality_issues,
+    import_bmg_clariostar_csv,
+    modified_gompertz,
+    plot_blank_well_qc,
+    plot_individual_blank_corrected_growth_curves,
+    plot_individual_raw_growth_curves,
+    plot_mean_sd_blank_corrected_growth_curves,
+    plot_mean_sd_growth_curves,
+    save_quality_summary,
+    summarise_technical_wells,
+    validate_growth_data,
+)
+
+
+@dataclass(frozen=True)
+class DatasetProfile:
+    """Expected plate structure and AUC windows for one supported export type."""
+    name: str
+    expected_unique_wells: int
+    expected_time_min: List[int]
+    dmso_order: List[float]
+    expected_replicates: object
+    auc_windows: List[tuple]
+    primary_auc_label: str
+    primary_auc_display: str
+    secondary_auc_label: str
+    secondary_auc_display: str
+
+
+FULL_PROFILE = DatasetProfile(
+    name="full",
+    expected_unique_wells=60,
+    expected_time_min=EXPECTED_TIME_MIN,
+    dmso_order=EXPECTED_DMSO_PERCENT,
+    expected_replicates=5,
+    auc_windows=[("0_17h", 0.0, 17.0), ("0_12h", 0.0, 12.0)],
+    primary_auc_label="0_17h",
+    primary_auc_display="0-17 h",
+    secondary_auc_label="0_12h",
+    secondary_auc_display="0-12 h",
+)
+
+DMSO_ONLY_PROFILE = DatasetProfile(
+    name="dmso-only",
+    expected_unique_wells=34,
+    expected_time_min=DMSO_ONLY_TIME_MIN,
+    dmso_order=DMSO_ONLY_DMSO_PERCENT,
+    expected_replicates=DMSO_ONLY_REPLICATES_BY_DMSO,
+    auc_windows=[("0_16h35min", 0.0, 995.0 / 60.0), ("0_12h", 0.0, 12.0)],
+    primary_auc_label="0_16h35min",
+    primary_auc_display="0-16 h 35 min",
+    secondary_auc_label="0_12h",
+    secondary_auc_display="0-12 h",
+)
+
+
+def infer_dataset_profile(growth_data: pd.DataFrame, requested_mode: str) -> DatasetProfile:
+    """Return the requested profile, or infer it from wells, doses, and times."""
+    if requested_mode == "full":
+        return FULL_PROFILE
+    if requested_mode == "dmso-only":
+        return DMSO_ONLY_PROFILE
+
+    observed_wells = int(growth_data["well"].nunique())
+    observed_dmso = sorted(growth_data["dmso_percent"].drop_duplicates().astype(float).tolist())
+    observed_times = sorted(growth_data["time_min"].drop_duplicates().astype(int).tolist())
+    if (
+        observed_wells == DMSO_ONLY_PROFILE.expected_unique_wells
+        and observed_dmso == DMSO_ONLY_PROFILE.dmso_order
+        and observed_times == DMSO_ONLY_PROFILE.expected_time_min
+    ):
+        return DMSO_ONLY_PROFILE
+    return FULL_PROFILE
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line inputs for one independent DMSO experiment."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Import, blank-correct, calculate AUC, and fit modified Gompertz models "
+            "for one DMSO-tolerance biological replicate."
+        )
+    )
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="Path to the annotated BMG CLARIOstar CSV export. The input file is read-only.",
+    )
+    parser.add_argument(
+        "--replicate-id",
+        required=True,
+        help="Biological replicate identifier for this input dataset, for example BR1, BR2, or BR3.",
+    )
+    parser.add_argument(
+        "--dataset-mode",
+        choices=["auto", "full", "dmso-only"],
+        default="auto",
+        help="Validation profile. Use dmso-only for the smaller DMSO-only dataset, or leave as auto.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(PROJECT_ROOT / "results" / "dmso_tolerance"),
+        help="Parent output directory. The replicate ID is used as the child folder name.",
+    )
+    parser.add_argument(
+        "--large-change-threshold",
+        type=float,
+        default=0.2,
+        help="Absolute OD600 change between consecutive readings flagged for raw-data QC.",
+    )
+    return parser.parse_args()
+
+
+def condition_color_map(dmso_order: List[float]) -> dict:
+    cmap = plt.get_cmap("viridis", len(dmso_order))
+    return {
+        concentration: cmap(index)
+        for index, concentration in enumerate(dmso_order)
+    }
+
+
+def plot_gompertz_fits(
+    corrected_data: pd.DataFrame,
+    metrics: pd.DataFrame,
+    output_dir: Path,
+    profile: DatasetProfile,
+) -> List[Path]:
+    """Plot observed W(t) data and fitted modified Gompertz curves by species."""
+
+    color_map = condition_color_map(profile.dmso_order)
+    paths: List[Path] = []
+
+    for species in sorted(corrected_data["species"].drop_duplicates()):
+        species_data = corrected_data[corrected_data["species"].eq(species)]
+        species_metrics = metrics[metrics["species"].eq(species)]
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True, sharey=True)
+        axes_flat = axes.flatten()
+        failed_labels = []
+
+        for ax, dmso_percent in zip(axes_flat, profile.dmso_order):
+            panel_data = species_data[species_data["dmso_percent"].eq(dmso_percent)]
+            panel_metrics = species_metrics[species_metrics["DMSO_percent"].eq(dmso_percent)]
+            color = color_map[dmso_percent]
+            for well, well_data in panel_data.groupby("well", sort=True):
+                w_data = calculate_w_response(well_data, "time_h", "corrected_OD600")
+                ax.scatter(
+                    w_data["time_h"],
+                    w_data["W"],
+                    s=8,
+                    color=color,
+                    alpha=0.35,
+                    marker="o",
+                )
+                fit_row = panel_metrics[panel_metrics["well"].eq(well)].iloc[0]
+                if str(fit_row["gompertz_fit_status"]).startswith("success"):
+                    t_fit = np.linspace(0, 17, 300)
+                    y_fit = modified_gompertz(
+                        t_fit,
+                        fit_row["A_OD600"],
+                        fit_row["Kz_OD600_per_h"],
+                        fit_row["TLag_h"],
+                    )
+                    ax.plot(t_fit, y_fit, color="black", alpha=0.45, linewidth=1.0)
+                else:
+                    failed_labels.append(f"{well} ({dmso_percent:g}%)")
+                    ax.text(
+                        0.04,
+                        0.9,
+                        f"{well} fit failed",
+                        transform=ax.transAxes,
+                        fontsize=8,
+                        color="crimson",
+                    )
+
+            ax.set_title(f"{dmso_percent:g}% DMSO")
+            ax.grid(alpha=0.25)
+        for ax in axes_flat[len(profile.dmso_order) :]:
+            ax.set_visible(False)
+
+        for ax in axes[:, 0]:
+            ax.set_ylabel("Change in blank-corrected OD600, W(t)")
+        for ax in axes[-1, :]:
+            ax.set_xlabel("Time (h)")
+
+        observed_handle = plt.Line2D(
+            [0],
+            [0],
+            color=color_map[profile.dmso_order[0]],
+            marker="o",
+            linestyle="",
+            markersize=5,
+            alpha=0.6,
+            label="Observed W(t)",
+        )
+        fitted_handle = plt.Line2D([0], [0], color="black", linewidth=1.5, label="Gompertz fit")
+        fig.legend(
+            handles=[observed_handle, fitted_handle],
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.94),
+            ncol=2,
+            frameon=False,
+        )
+        title = f"Modified Gompertz fits: {DISPLAY_SPECIES.get(species, species)}"
+        if failed_labels:
+            title += f" | Failed fits: {', '.join(failed_labels)}"
+        fig.suptitle(title, y=0.99)
+        fig.tight_layout(rect=[0, 0, 1, 0.88])
+        path = output_dir / f"gompertz_fits_{species}.png"
+        fig.savefig(path, dpi=300)
+        plt.close(fig)
+        paths.append(path)
+
+    return paths
+
+
+def plot_species_metric_review(
+    metrics: pd.DataFrame,
+    summary: pd.DataFrame,
+    output_dir: Path,
+    profile: DatasetProfile,
+) -> List[Path]:
+    """Plot per-well values and mean +/- technical SD for core BR metrics."""
+
+    color_map = condition_color_map(profile.dmso_order)
+    primary_relative_col = f"relative_AUC_{profile.primary_auc_label}_percent"
+    primary_relative_mean_col = f"{primary_relative_col}_mean"
+    primary_relative_sd_col = f"{primary_relative_col}_SD_technical"
+    paths: List[Path] = []
+    panels = [
+        (
+            primary_relative_col,
+            primary_relative_mean_col,
+            primary_relative_sd_col,
+            f"Relative AUC {profile.primary_auc_display} (%)",
+        ),
+        ("Kz_OD600_per_h", "Kz_OD600_per_h_mean", "Kz_OD600_per_h_SD_technical", "Kz (OD600/h)"),
+        ("TLag_h", "TLag_h_mean", "TLag_h_SD_technical", "TLag (h)"),
+        ("A_OD600", "A_OD600_mean", "A_OD600_SD_technical", "A (OD600)"),
+    ]
+
+    for species in sorted(metrics["species"].drop_duplicates()):
+        species_metrics = metrics[metrics["species"].eq(species)]
+        species_summary = summary[summary["species"].eq(species)]
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        axes_flat = axes.flatten()
+
+        for ax, (value_col, mean_col, sd_col, ylabel) in zip(axes_flat, panels):
+            for x_index, dmso_percent in enumerate(profile.dmso_order):
+                group = species_metrics[species_metrics["DMSO_percent"].eq(dmso_percent)]
+                summary_row = species_summary[species_summary["DMSO_percent"].eq(dmso_percent)].iloc[0]
+                color = color_map[dmso_percent]
+                x_values = np.full(len(group), x_index, dtype=float)
+                jitter = np.linspace(-0.09, 0.09, len(group)) if len(group) else np.array([])
+                ax.scatter(
+                    x_values + jitter,
+                    group[value_col],
+                    color=color,
+                    edgecolor="black",
+                    linewidth=0.3,
+                    alpha=0.8,
+                    zorder=3,
+                )
+                ax.errorbar(
+                    x_index,
+                    summary_row[mean_col],
+                    yerr=summary_row[sd_col],
+                    color="black",
+                    marker="_",
+                    markersize=16,
+                    capsize=4,
+                    linewidth=1.2,
+                    zorder=4,
+                )
+            if value_col == primary_relative_col:
+                ax.axhline(100, color="black", linestyle="-", linewidth=0.8, alpha=0.6)
+                ax.axhline(90, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+            ax.set_xticks(range(len(profile.dmso_order)))
+            ax.set_xticklabels([f"{value:g}" for value in profile.dmso_order])
+            ax.set_xlabel("DMSO (%)")
+            ax.set_ylabel(ylabel)
+            ax.grid(axis="y", alpha=0.25)
+
+        fig.suptitle(f"DMSO growth metrics: {DISPLAY_SPECIES.get(species, species)}")
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        path = output_dir / f"dmso_growth_metrics_{species}.png"
+        fig.savefig(path, dpi=300)
+        plt.close(fig)
+        paths.append(path)
+
+    return paths
+
+
+def plot_early_growth_auc(
+    metrics: pd.DataFrame,
+    summary: pd.DataFrame,
+    output_dir: Path,
+    profile: DatasetProfile,
+) -> Path:
+    """Plot secondary early-growth relative AUC from 0-12 h."""
+
+    color_map = condition_color_map(profile.dmso_order)
+    secondary_relative_col = f"relative_AUC_{profile.secondary_auc_label}_percent"
+    secondary_relative_mean_col = f"{secondary_relative_col}_mean"
+    secondary_relative_sd_col = f"{secondary_relative_col}_SD_technical"
+    species_order = sorted(metrics["species"].drop_duplicates())
+    fig, axes = plt.subplots(1, len(species_order), figsize=(12, 5), sharey=True)
+    if len(species_order) == 1:
+        axes = [axes]
+
+    for ax, species in zip(axes, species_order):
+        species_metrics = metrics[metrics["species"].eq(species)]
+        species_summary = summary[summary["species"].eq(species)]
+        for x_index, dmso_percent in enumerate(profile.dmso_order):
+            group = species_metrics[species_metrics["DMSO_percent"].eq(dmso_percent)]
+            summary_row = species_summary[species_summary["DMSO_percent"].eq(dmso_percent)].iloc[0]
+            color = color_map[dmso_percent]
+            jitter = np.linspace(-0.09, 0.09, len(group)) if len(group) else np.array([])
+            ax.scatter(
+                np.full(len(group), x_index, dtype=float) + jitter,
+                group[secondary_relative_col],
+                color=color,
+                edgecolor="black",
+                linewidth=0.3,
+                alpha=0.8,
+                zorder=3,
+            )
+            ax.errorbar(
+                x_index,
+                summary_row[secondary_relative_mean_col],
+                yerr=summary_row[secondary_relative_sd_col],
+                color="black",
+                marker="_",
+                markersize=16,
+                capsize=4,
+                linewidth=1.2,
+                zorder=4,
+            )
+        ax.axhline(100, color="black", linestyle="-", linewidth=0.8, alpha=0.6)
+        ax.axhline(90, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.set_xticks(range(len(profile.dmso_order)))
+        ax.set_xticklabels([f"{value:g}" for value in profile.dmso_order])
+        ax.set_xlabel("DMSO (%)")
+        ax.set_title(DISPLAY_SPECIES.get(species, species))
+        ax.grid(axis="y", alpha=0.25)
+
+    axes[0].set_ylabel(f"Secondary early-growth relative AUC {profile.secondary_auc_display} (%)")
+    fig.suptitle(f"Secondary early-growth AUC from {profile.secondary_auc_display}")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    path = output_dir / "early_growth_AUC_0_12h.png"
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+    return path
+
+
+def main() -> int:
+    """Run import, validation, correction, quantification, plotting, and export."""
+    args = parse_args()
+    input_path = Path(args.input)
+    output_dir = Path(args.output_dir) / args.replicate_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    measurement_data = import_bmg_clariostar_csv(input_path, include_blank_rows=True)
+    growth_data = measurement_data[measurement_data["species"].ne("Blank")].copy()
+    profile = infer_dataset_profile(growth_data, args.dataset_mode)
+    validation_summary = validate_growth_data(
+        growth_data,
+        expected_unique_wells=profile.expected_unique_wells,
+        expected_time_min=profile.expected_time_min,
+        expected_dmso_percent=profile.dmso_order,
+        expected_replicates=profile.expected_replicates,
+    )
+    flags = flag_quality_issues(
+        growth_data,
+        large_change_threshold=args.large_change_threshold,
+    )
+
+    blank_correction = apply_time_matched_blank_correction(
+        measurement_data=measurement_data,
+        blank_well_ids=["A1", "A3"],
+        excluded_blank_well_ids=["A2"],
+        time_column="time_min",
+        raw_od_column="od600",
+        excluded_blank_reasons={"A2": DEFAULT_A2_EXCLUSION_REASON},
+    )
+    corrected_data = blank_correction.corrected_data
+    metrics = fit_all_wells(
+        corrected_data,
+        biological_replicate=args.replicate_id,
+        auc_windows=profile.auc_windows,
+        expected_unique_wells=profile.expected_unique_wells,
+        expected_time_min=profile.expected_time_min,
+        expected_dmso_percent=profile.dmso_order,
+        expected_replicates=profile.expected_replicates,
+    )
+    summary = summarise_technical_wells(metrics)
+
+    processed_path = output_dir / "processed_growth_data.csv"
+    flags_path = output_dir / "quality_control_flags.csv"
+    blank_qc_path = output_dir / "blank_qc_summary.csv"
+    blank_trace_path = output_dir / "blank_trace_used.csv"
+    corrected_path = output_dir / "blank_corrected_growth_data.csv"
+    metrics_path = output_dir / "growth_metrics_per_well.csv"
+    summary_path = output_dir / "biological_replicate_summary.csv"
+
+    growth_data.to_csv(processed_path, index=False)
+    flags.to_csv(flags_path, index=False)
+    blank_correction.blank_qc_summary.to_csv(blank_qc_path, index=False)
+    blank_correction.blank_trace_used.to_csv(blank_trace_path, index=False)
+    corrected_data.to_csv(corrected_path, index=False)
+    metrics.to_csv(metrics_path, index=False)
+    summary.to_csv(summary_path, index=False)
+    raw_qc_summary_path = save_quality_summary(
+        validation_summary,
+        flags,
+        output_dir,
+        large_change_threshold=args.large_change_threshold,
+    )
+
+    plot_paths = []
+    plot_paths.extend(plot_individual_raw_growth_curves(growth_data, output_dir))
+    plot_paths.extend(plot_mean_sd_growth_curves(growth_data, output_dir))
+    plot_paths.append(
+        plot_blank_well_qc(
+            measurement_data,
+            blank_correction.blank_trace_used,
+            blank_correction.blank_qc_summary,
+            output_dir,
+        )
+    )
+    plot_paths.extend(
+        plot_individual_blank_corrected_growth_curves(
+            corrected_data,
+            output_dir,
+            dmso_order=profile.dmso_order,
+        )
+    )
+    plot_paths.extend(
+        plot_mean_sd_blank_corrected_growth_curves(
+            corrected_data,
+            output_dir,
+            dmso_order=profile.dmso_order,
+        )
+    )
+    plot_paths.extend(plot_gompertz_fits(corrected_data, metrics, output_dir, profile))
+    plot_paths.extend(plot_species_metric_review(metrics, summary, output_dir, profile))
+    plot_paths.append(plot_early_growth_auc(metrics, summary, output_dir, profile))
+
+    successful_fits = int(metrics["gompertz_fit_status"].astype(str).str.startswith("success").sum())
+    failed_fits = int(len(metrics) - successful_fits)
+
+    print("Validation summary")
+    print(f"- biological_replicate: {args.replicate_id}")
+    print(f"- dataset_mode: {profile.name}")
+    print(f"- output folder: {output_dir}")
+    print(f"- unique_wells: {validation_summary.unique_wells}")
+    print(f"- measurements_per_well: {validation_summary.measurements_per_well}")
+    print(
+        "- time_min: "
+        f"{validation_summary.time_min_start} to {validation_summary.time_min_end} "
+        f"in {validation_summary.time_step_min}-minute intervals"
+    )
+    print(f"- species_count: {validation_summary.species_count}")
+    for species, count in sorted(validation_summary.dmso_condition_count_per_species.items()):
+        print(f"- dmso_condition_count[{species}]: {count}")
+    for key, count in sorted(validation_summary.replicate_count_per_species_condition.items()):
+        species, dmso_percent = key
+        print(f"- technical_wells[{species}, {dmso_percent:g}%]: {count}")
+    print("- blank correction: applied exactly once from raw OD600 using A1/A3 time-matched means")
+    print(f"- blank well excluded from correction: A2 ({DEFAULT_A2_EXCLUSION_REASON})")
+    print(
+        "- blank-corrected sample measurements: "
+        f"{len(corrected_data)} rows across {corrected_data['well'].nunique()} wells"
+    )
+    print(f"- per-well metrics rows: {len(metrics)}")
+    print(f"- biological-replicate summary rows: {len(summary)}")
+    print(f"- successful Gompertz fits: {successful_fits}")
+    print(f"- failed Gompertz fits: {failed_fits}")
+    for species in sorted(metrics["species"].drop_duplicates()):
+        r2 = metrics.loc[
+            metrics["species"].eq(species) & metrics["gompertz_R2"].notna(),
+            "gompertz_R2",
+        ]
+        print(
+            f"- {species} Gompertz R2 min/median/max: "
+            f"{r2.min():.4f} / {r2.median():.4f} / {r2.max():.4f}"
+        )
+    print("")
+    print("Saved outputs")
+    for label, path in [
+        ("raw processed data", processed_path),
+        ("raw QC summary", raw_qc_summary_path),
+        ("raw QC flags", flags_path),
+        ("blank QC summary", blank_qc_path),
+        ("blank trace used", blank_trace_path),
+        ("blank-corrected data", corrected_path),
+        ("per-well metrics", metrics_path),
+        ("biological-replicate summary", summary_path),
+    ]:
+        print(f"- {label}: {path}")
+    for path in plot_paths:
+        print(f"- plot: {path}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

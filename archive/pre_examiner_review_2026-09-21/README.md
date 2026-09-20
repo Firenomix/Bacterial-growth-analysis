@@ -1,77 +1,6 @@
 # Bacterial Growth Analysis
 
-Reproducible Python workflows for importing, validating, blank-correcting,
-quantifying, statistically analysing, and plotting bacterial OD600 growth
-experiments. Raw instrument exports remain outside the repository and are
-supplied explicitly on the command line.
-
-## Repository layout and provenance
-
-The repository preserves the analysis hierarchy used in the thesis:
-
-| Path | Role |
-| --- | --- |
-| `src/growth_analysis.py` | Shared parsing, validation, blank correction, AUC, modified-Gompertz fitting, and QC plotting functions. |
-| `analyses/dmso_tolerance.py` | Processes and quantifies one DMSO-tolerance biological replicate; it does not perform cross-replicate inference. |
-| `analyses/drug_screening_single_run.py` | Processes one species-specific drug-screening workbook and averages technical wells within that run. |
-| `analyses/combine_drug_screening_growth_curves.py` | Combines already corrected BR1-BR3 curves descriptively, preserving hierarchical averaging. |
-| `analyses/drug_screening_statistics.py` | Runs randomized-block ANOVA and blocked-residual Tukey comparisons on biological-replicate means. |
-| `analyses/drug_screening_thesis_figures.py` | Generates thesis-ready monotherapy figures and their figure-specific audit tables. |
-| `analyses/plot_combination_treatment_descriptive.py` | Plots the matched BR2/BR3 combination regimen descriptively; it performs no inferential test. |
-| `analyses/liposome_metric_plots.py` | Imports or loads liposome metrics, applies the selected blank rule, and runs blocked inference when enough BRs are available. |
-| `tests/` | Unit and integration tests for validation, calculations, blocked inference, and plotting contracts. |
-| `results/` | Generated tables and figures. These are derived outputs, not raw data. |
-
-The exact source state immediately before the examiner-readiness documentation
-review is retained under `archive/pre_examiner_review_2026-09-21/`. Archived
-Python files use the suffix `.py.original` so pytest cannot accidentally collect
-or import them. The active scripts above remain the authoritative versions.
-
-### Original-to-repository filename map
-
-The supplied scripts did not need upload-suffix removal; their descriptive
-filenames were retained and organized by responsibility:
-
-| Original supplied filename | Final repository path |
-| --- | --- |
-| `growth_analysis.py` | `src/growth_analysis.py` |
-| `dmso_tolerance.py` | `analyses/dmso_tolerance.py` |
-| `drug_screening_single_run.py` | `analyses/drug_screening_single_run.py` |
-| `combine_drug_screening_growth_curves.py` | `analyses/combine_drug_screening_growth_curves.py` |
-| `drug_screening_statistics.py` | `analyses/drug_screening_statistics.py` |
-| `drug_screening_thesis_figures.py` | `analyses/drug_screening_thesis_figures.py` |
-| `plot_combination_treatment_descriptive.py` | `analyses/plot_combination_treatment_descriptive.py` |
-| `liposome_metric_plots.py` | `analyses/liposome_metric_plots.py` |
-
-### Installation
-
-Python 3.9 or later is recommended. Install the declared dependencies from the
-repository root:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-### Execution order
-
-The workflows are related but independent; DMSO, drug-screening, and liposome
-datasets are not combined with one another.
-
-1. DMSO: run `dmso_tolerance.py` once for each input biological replicate. Run
-   the separate DMSO cross-replicate statistics stage only after the relevant
-   replicate summaries exist.
-2. Drug screening: run `drug_screening_single_run.py` for each species and BR.
-3. Drug-screening curves: run `combine_drug_screening_growth_curves.py`
-   separately for each species after BR1-BR3 corrected CSVs exist.
-4. Drug-screening inference: run `drug_screening_statistics.py` after all six
-   species-by-BR run directories exist.
-5. Drug-screening presentation: run `drug_screening_thesis_figures.py` from the
-   same six run directories. Optionally run
-   `plot_combination_treatment_descriptive.py` on the descriptive metrics table
-   produced by the statistics stage.
-6. Liposomes: run `liposome_metric_plots.py` directly from labelled workbooks
-   or from its paired processed metric files. This workflow is independent of
-   the drug-screening stages.
+Reusable Python analysis of bacterial OD600 growth curves.
 
 The first analysis examines the effect of different DMSO concentrations on the
 growth of *Escherichia coli* K-12 MG1655 and *Bacillus subtilis* ATCC 6051.
@@ -81,6 +10,12 @@ growth of *Escherichia coli* K-12 MG1655 and *Bacillus subtilis* ATCC 6051.
 This repository keeps analysis code separate from raw instrument exports. The
 annotated BMG CLARIOstar CSV is read from a command-line path and is not
 modified.
+
+Install the Python requirements:
+
+```powershell
+python -m pip install -r requriements.txt
+```
 
 Run the import, validation, QC-flagging, blank-correction, and growth-curve
 plotting stages:
@@ -543,72 +478,6 @@ The thesis-figure tables are:
 - `thesis_figure_vehicle_tukey_comparisons.csv`
 - `penag_lag_fit_availability.csv`
 - `thesis_figure_manifest.csv`
-
-## Combination-treatment descriptive figures
-
-This optional presentation stage reads the long-format
-`combination_treatment_descriptive_metrics.csv` created by
-`drug_screening_statistics.py`. It is restricted to the matched BR2/BR3 regimen
-of 25 uM compound plus 4 ug/mL ampicillin and the corresponding 4 ug/mL
-ampicillin-only control.
-
-```powershell
-python analyses/plot_combination_treatment_descriptive.py `
-  --input "results\drug_screening\statistics\combination_treatment_descriptive_metrics.csv" `
-  --output-dir "results\drug_screening\statistics\combination_treatment_descriptive_plots"
-```
-
-The plotted value is `technical_mean`, which is already the mean of the three
-technical wells within one biological replicate. `technical_SD` is not used to
-reconstruct observations. Repeated contextual rows for the ampicillin-only
-control must agree within strict numerical tolerance before one copy is
-retained. BR2 and BR3 are displayed as separate points; a short mean line is
-drawn only when both values are available. This script performs no statistical
-test and adds no significance annotations.
-
-Outputs include plot-ready long and wide QC tables, unit-conversion notes,
-warnings, and individual/combined PNG and PDF figures.
-
-## Liposome metric workflow
-
-`liposome_metric_plots.py` is a separate workflow for the annotated liposome
-experiments. It can calculate per-well AUC and modified-Gompertz metrics from
-raw workbooks or consume paired processed metric files. Technical wells are
-averaged within each biological replicate before any inference.
-
-Example using raw workbooks:
-
-```powershell
-python analyses/liposome_metric_plots.py `
-  --workbook "BR1=path\to\BR1.xlsx" `
-  --workbook "BR2=path\to\BR2.xlsx" `
-  --workbook "BR3=path\to\BR3.xlsx" `
-  --liposome-blank-source pbs `
-  --output-dir "results\liposome_metric_plots"
-```
-
-`--liposome-blank-source matching` uses the condition-matched blank rules;
-`pbs` uses the time-matched PBS blank mean for liposome-containing wells. The
-selected rule is recorded in the outputs. Raw OD values are retained, and
-missing or failed Gompertz fits are not replaced with zero.
-
-For each eligible species, treatment family, and metric, inference uses the
-biological-replicate means in the model:
-
-```text
-metric ~ treatment + biological_replicate
-```
-
-Tukey all-pair comparisons use the residual mean square and degrees of freedom
-from that blocked model. The default minimum is three biological replicates.
-`--minimum-statistical-brs 2` is available only as an explicit exploratory
-override and should be reported with its low residual degrees of freedom. If
-fewer than the selected minimum are available, descriptive outputs are still
-created and the reason for omitting inference is written to the warning file.
-
-Main outputs are per-well metrics, biological-replicate means, hierarchical
-summaries, randomized-block ANOVA and Tukey tables, a warnings text file, and
-publication-quality PNG/PDF metric figures under the selected output directory.
 
 ## BR1-BR3 randomized-block statistics
 
